@@ -170,69 +170,72 @@ def parse_timeline(input_path, year):
     except Exception as e:
         print(f"Error reading JSON: {e}")
         sys.exit(1)
-        
-    segments = data.get('semanticSegments', [])
+
+    if isinstance(data, dict):
+        segments = data.get('semanticSegments', [])
+    elif isinstance(data, list):
+        segments = data
+    else:
+        print("Unsupported JSON format")
+        sys.exit(1)
+
     print(f"Parsing {len(segments)} segments for year {year}...")
-    
-    points = [] # dicts of {dt, lat, lon}
-    
+
+    points = []
+
     for seg in segments:
-        # Check time
         start_str = seg.get('startTime')
-        if not start_str: continue
+        if not start_str:
+            continue
         try:
             dt = dateutil.parser.parse(start_str)
-        except: continue
-        
+        except Exception:
+            continue
+
         if dt.year != year:
             continue
-            
-        # 1. timelinePath
-        path = seg.get('timelinePath', [])
-        if path:
-            for p in path:
-                pt_str = p.get('point')
-                tm_str = p.get('time')
-                if pt_str and tm_str:
+
+        visit = seg.get('visit')
+        if visit:
+            top = visit.get('topCandidate', {})
+            loc = top.get('placeLocation')
+            if isinstance(loc, str) and loc.startswith("geo:"):
+                try:
+                    coord = loc[4:]
+                    lat_str, lon_str = coord.split(',')
+                    lat = float(lat_str)
+                    lon = float(lon_str)
+                    points.append({'dt': dt, 'lat': lat, 'lon': lon})
+                except Exception:
+                    pass
+
+        activity = seg.get('activity')
+        if activity:
+            for key in ('start', 'end'):
+                loc = activity.get(key)
+                if isinstance(loc, str) and loc.startswith("geo:"):
                     try:
-                        # "37.123°, 127.123°"
-                        parts = pt_str.replace('°','').split(',')
-                        lat = float(parts[0])
-                        lon = float(parts[1])
-                        t = dateutil.parser.parse(tm_str)
-                        points.append({'dt':t, 'lat':lat, 'lon':lon})
-                    except: pass
-        
-        # 2. Visit (Top Candidate)
-        if 'visit' in seg:
-            visit = seg['visit']
-            if 'topCandidate' in visit:
-                 loc = visit['topCandidate'].get('placeLocation', {})
-                 latlng = loc.get('latLng')
-                 if latlng:
-                     try:
-                        parts = latlng.replace('°','').split(',')
-                        lat = float(parts[0])
-                        lon = float(parts[1])
-                        # Use segment start time for visit anchor
-                        points.append({'dt':dt, 'lat':lat, 'lon':lon})
-                     except: pass
+                        coord = loc[4:]
+                        lat_str, lon_str = coord.split(',')
+                        lat = float(lat_str)
+                        lon = float(l_str)
+                        points.append({'dt': dt, 'lat': lat, 'lon': lon})
+                    except Exception:
+                        pass
 
     if not points:
         print(f"No data points found for year {year}.")
         sys.exit(1)
-        
-    # Sort
+
     points.sort(key=lambda x: x['dt'])
     print(f"Found {len(points)} valid points.")
-    
-    # Process into arrays & Project
+
     timestamps = []
     lats = []
     lons = []
     xs = []
     ys = []
-    
+
     for p in points:
         timestamps.append(p['dt'])
         lats.append(p['lat'])
@@ -240,15 +243,14 @@ def parse_timeline(input_path, year):
         x, y = latlon_to_meters(p['lat'], p['lon'])
         xs.append(x)
         ys.append(y)
-        
-    # Calculate Distances (Haversine) for animation timing
+
     cum_dist = [0.0]
     total = 0.0
     for i in range(1, len(lats)):
-        d = haversine_dist(lats[i-1], lons[i-1], lats[i], lons[i])
+        d = haversine_dist(lats[i - 1], lons[i - 1], lats[i], lons[i])
         total += d
         cum_dist.append(total)
-        
+
     return timestamps, xs, ys, cum_dist, lats, lons
 
 def main():
@@ -320,7 +322,8 @@ def main():
         
     # Visualization
     print("Setting up animation...")
-    fig, ax = plt.subplots(figsize=(10,10))
+    # 인스타그램 릴스(9:16 비율)에 맞춘 세로형 캔버스
+    fig, ax = plt.subplots(figsize=(9, 16))
     # Remove whitespace
     fig.subplots_adjust(left=0, bottom=0, right=1, top=1, wspace=None, hspace=None)
     ax.axis('off')
@@ -386,7 +389,8 @@ def main():
     ani = animation.FuncAnimation(fig, update, frames=len(frame_indices), blit=False)
     
     print(f"Saving to {args.output}...")
-    ani.save(args.output, writer='ffmpeg', fps=DEFAULT_FPS, dpi=100)
+    # 9x16 inch * 120 dpi = 1080x1920 해상도
+    ani.save(args.output, writer='ffmpeg', fps=DEFAULT_FPS, dpi=120)
     print("Done!")
 
 if __name__ == "__main__":
