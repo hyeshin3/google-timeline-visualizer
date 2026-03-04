@@ -49,6 +49,11 @@ SMOOTHING_FACTOR = 0.07
 LOOKAHEAD_KM = 1500 
 MIN_ZOOM_SPAN_METERS = 30000 
 
+# Animation Timing
+# flying 구간은 동일 거리 대비 더 짧은 시간으로 표현하기 위해 "유효 거리"를 줄여서 처리한다.
+# (예: speedup=4.0 이면 비행 구간의 유효 거리는 1/4 → 전체 영상에서 비행 시간이 더 짧아짐)
+DEFAULT_FLIGHT_SPEEDUP = 4.0
+
 # Web Mercator Constants
 R_EARTH = 6378137.0
 MAX_EXTENT = 20037508.342789244
@@ -227,7 +232,7 @@ def get_map_image(x_center, y_center, span, width_px=800):
 
 # --- DATA PROCESSING ---
 
-def parse_timeline(input_path, year):
+def parse_timeline(input_path, year, flight_speedup, bridge_gaps_km=0.0, bridge_gaps_as_flying=True):
     print(f"Loading {input_path}...")
     try:
         with open(input_path, 'r', encoding='utf-8') as f:
@@ -302,6 +307,7 @@ def parse_timeline(input_path, year):
     print(f"Found {len(points)} valid points before flight smoothing.")
 
     # 비행 구간(flying)에 대해서만 구면 보간을 사용해 중간 점을 추가해 비행 경로를 더 자연스럽게 만든다.
+    # 또한 큰 거리 점프(비행/누락 데이터 등) 구간은 옵션으로 자동 보간해 "끊김"을 줄인다.
     expanded_points = []
     if points:
         expanded_points.append(points[0])
@@ -311,11 +317,13 @@ def parse_timeline(input_path, year):
             prev_mode = prev.get('mode')
             curr_mode = curr.get('mode')
             is_flight = (prev_mode == 'flying') or (curr_mode == 'flying')
+            d = haversine_dist(prev['lat'], prev['lon'], curr['lat'], curr['lon'])
+            should_bridge_gap = bool(bridge_gaps_km) and (d >= float(bridge_gaps_km))
+            should_interpolate = is_flight or should_bridge_gap
 
-            if is_flight:
-                # 긴 비행 구간일수록 조금 더 많은 점을 추가한다.
+            if should_interpolate:
+                # 긴 구간일수록 조금 더 많은 점을 추가한다.
                 base_segments = 32
-                d = haversine_dist(prev['lat'], prev['lon'], curr['lat'], curr['lon'])
                 extra_segments = max(base_segments, int(d / 200))  # 대략 200km당 한 세그먼트
                 mid_points = generate_geodesic_points(prev['lat'], prev['lon'],
                                                       curr['lat'], curr['lon'],
@@ -324,11 +332,12 @@ def parse_timeline(input_path, year):
                 for idx, (mlat, mlon) in enumerate(mid_points, start=1):
                     frac = idx / (total + 1)
                     dt_mid = prev['dt'] + (curr['dt'] - prev['dt']) * frac
+                    mid_mode = 'flying' if (is_flight or bridge_gaps_as_flying) else curr_mode
                     expanded_points.append({
                         'dt': dt_mid,
                         'lat': mlat,
                         'lon': mlon,
-                        'mode': 'flying'
+                        'mode': mid_mode
                     })
                 expanded_points.append(curr)
             else:
@@ -352,6 +361,7 @@ def parse_timeline(input_path, year):
     timestamps = []
     lats = []
     lons = []
+    modes = []
     xs = []
     ys = []
 
@@ -359,18 +369,31 @@ def parse_timeline(input_path, year):
         timestamps.append(p['dt'])
         lats.append(p['lat'])
         lons.append(p['lon'])
+        modes.append(p.get('mode'))
         x, y = latlon_to_meters(p['lat'], p['lon'])
         xs.append(x)
         ys.append(y)
 
-    cum_dist = [0.0]
-    total = 0.0
+    # 누적 거리(실거리)와 누적 유효거리(애니메이션 시간축)를 분리한다.
+    cum_dist_real = [0.0]
+    cum_dist_effective = [0.0]
+    total_real = 0.0
+    total_effective = 0.0
+
+    if not flight_speedup or flight_speedup < 1.0:
+        flight_speedup = 1.0
+    flight_weight = 1.0 / float(flight_speedup)
+
     for i in range(1, len(lats)):
         d = haversine_dist(lats[i - 1], lons[i - 1], lats[i], lons[i])
-        total += d
-        cum_dist.append(total)
+        total_real += d
+        cum_dist_real.append(total_real)
 
-    return timestamps, xs, ys, cum_dist, lats, lons
+        is_flight = (modes[i] == 'flying') or (modes[i - 1] == 'flying')
+        total_effective += d * (flight_weight if is_flight else 1.0)
+        cum_dist_effective.append(total_effective)
+
+    return timestamps, xs, ys, cum_dist_effective, cum_dist_real, lats, lons
 
 def main():
     parser = argparse.ArgumentParser(description="Google Timeline Visualizer")
@@ -382,37 +405,55 @@ def main():
     parser.add_argument('--gif-only', action='store_true', help="Generate only a GIF (no MP4 video). Implies --preview-gif.")
     parser.add_argument('--preview-output', default=None, help="Output path for preview GIF (default: same as --output but with .gif extension)")
     parser.add_argument('--preview-max-distance-km', type=float, default=None, help="Maximum travel distance (km) to include in the preview GIF. If not set, defaults to 30% of total distance.")
+    parser.add_argument('--flight-speedup', type=float, default=DEFAULT_FLIGHT_SPEEDUP, help="Speed multiplier for segments tagged as flying (>=1). Higher is faster (shorter).")
+    parser.add_argument('--bridge-gaps-km', type=float, default=0.0, help="If >0, interpolate (geodesic) any jump >= this distance (km) even when not tagged as flying.")
+    parser.add_argument('--bridge-gaps-as-flying', action='store_true', default=True, help="When bridging gaps, mark interpolated points as 'flying' so --flight-speedup applies.")
+    parser.add_argument('--no-bridge-gaps-as-flying', action='store_false', dest='bridge_gaps_as_flying', help="When bridging gaps, do not mark interpolated points as 'flying'.")
     
     args = parser.parse_args()
+
+    if args.flight_speedup is None or args.flight_speedup < 1.0:
+        print("Error: --flight-speedup must be >= 1")
+        sys.exit(1)
+    if args.bridge_gaps_km is None or args.bridge_gaps_km < 0.0:
+        print("Error: --bridge-gaps-km must be >= 0")
+        sys.exit(1)
     
     # Load
-    timestamps, xs, ys, cum_dist, lats, lons = parse_timeline(args.input, args.year)
+    timestamps, xs, ys, cum_dist_effective, cum_dist_real, lats, lons = parse_timeline(
+        args.input,
+        args.year,
+        args.flight_speedup,
+        bridge_gaps_km=args.bridge_gaps_km,
+        bridge_gaps_as_flying=args.bridge_gaps_as_flying,
+    )
     
-    total_km = cum_dist[-1]
-    print(f"Total distance: {total_km:.1f} km")
+    total_km_real = cum_dist_real[-1]
+    total_km_effective = cum_dist_effective[-1]
+    print(f"Total distance: {total_km_real:.1f} km (effective: {total_km_effective:.1f} km, flight speedup: {args.flight_speedup}x)")
     
     # Prepare Frame Indices (Distance Based)
     total_frames = DEFAULT_FPS * DEFAULT_DURATION
-    km_per_frame = total_km / total_frames
+    km_per_frame = total_km_effective / total_frames
     
     print(f"Target: {DEFAULT_DURATION}s @ {DEFAULT_FPS}fps. {km_per_frame:.3f} km/frame")
     
     frames_dist = [i * km_per_frame for i in range(total_frames)]
     frame_indices = []
     for d in frames_dist:
-        idx = bisect.bisect_left(cum_dist, d)
-        idx = min(idx, len(cum_dist)-1)
+        idx = bisect.bisect_left(cum_dist_effective, d)
+        idx = min(idx, len(cum_dist_effective)-1)
         frame_indices.append(idx)
 
     # Preview frame count (for optional GIF)
     preview_frame_count = len(frame_indices)
     if getattr(args, 'preview_gif', False) or getattr(args, 'gif_only', False):
         if args.preview_max_distance_km is not None and args.preview_max_distance_km > 0:
-            max_d = min(args.preview_max_distance_km, total_km)
+            max_d = min(args.preview_max_distance_km, total_km_real)
         else:
-            max_d = total_km * 0.3
+            max_d = total_km_real * 0.3
         # 프리뷰는 지정 거리 이내의 프레임까지만 포함
-        preview_frame_count = max(1, sum(1 for d in frames_dist if d <= max_d))
+        preview_frame_count = max(1, sum(1 for idx in frame_indices if cum_dist_real[idx] <= max_d))
         
     # Camera Calculation
     print("Calculating camera path...")
@@ -427,8 +468,8 @@ def main():
         
         # Lookahead
         target_d = frame_d + LOOKAHEAD_KM
-        look_idx = bisect.bisect_left(cum_dist, target_d)
-        look_idx = min(look_idx, len(cum_dist)-1)
+        look_idx = bisect.bisect_left(cum_dist_effective, target_d)
+        look_idx = min(look_idx, len(cum_dist_effective)-1)
         
         # Get bounds of window
         w_xs = xs[idx : look_idx+1] or [xs[idx]]
@@ -502,9 +543,9 @@ def main():
         path_line.set_data(_xs, _ys)
         
         # Tail
-        curr_km = cum_dist[frame_idx]
+        curr_km = cum_dist_real[frame_idx]
         start_km = max(0, curr_km - DEFAULT_TAIL_KM)
-        start_idx = bisect.bisect_left(cum_dist, start_km)
+        start_idx = bisect.bisect_left(cum_dist_real, start_km)
         
         txs = xs[start_idx : frame_idx+1]
         tys = ys[start_idx : frame_idx+1]
