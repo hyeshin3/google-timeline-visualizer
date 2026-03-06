@@ -31,8 +31,14 @@ try:
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
     import matplotlib.font_manager as fm
+    import matplotlib.patches as patches
     from PIL import Image
     import dateutil.parser
+    import reverse_geocoder as rg
+    import pycountry
+    
+    # Configure fallback fonts for Helvetica
+    plt.rcParams['font.sans-serif'] = ['Helvetica', 'Arial', 'sans-serif']
 except ImportError as e:
     print(f"Error: Missing dependency {e.name}. Please run: pip install -r requirements.txt")
     sys.exit(1)
@@ -52,7 +58,7 @@ MIN_ZOOM_SPAN_METERS = 30000
 # Animation Timing
 # flying 구간은 동일 거리 대비 더 짧은 시간으로 표현하기 위해 "유효 거리"를 줄여서 처리한다.
 # (예: speedup=4.0 이면 비행 구간의 유효 거리는 1/4 → 전체 영상에서 비행 시간이 더 짧아짐)
-DEFAULT_FLIGHT_SPEEDUP = 4.0
+DEFAULT_FLIGHT_SPEEDUP = 10.0
 
 # Web Mercator Constants
 R_EARTH = 6378137.0
@@ -241,63 +247,103 @@ def parse_timeline(input_path, year, flight_speedup, bridge_gaps_km=0.0, bridge_
         print(f"Error reading JSON: {e}")
         sys.exit(1)
 
-    if isinstance(data, dict):
+    is_flattened = isinstance(data, list) and len(data) > 0 and 'start_time' in data[0]
+
+    if is_flattened:
+        print(f"Parsing {len(data)} flattened segments for year {year}...")
+        segments = [] # not used
+    elif isinstance(data, dict):
         segments = data.get('semanticSegments', [])
+        print(f"Parsing {len(segments)} segments for year {year}...")
     elif isinstance(data, list):
         segments = data
+        print(f"Parsing {len(segments)} segments for year {year}...")
     else:
         print("Unsupported JSON format")
         sys.exit(1)
 
-    print(f"Parsing {len(segments)} segments for year {year}...")
-
     points = []
 
-    for seg in segments:
-        start_str = seg.get('startTime')
-        if not start_str:
-            continue
-        try:
-            dt = dateutil.parser.parse(start_str)
-        except Exception:
-            continue
+    if is_flattened:
+        for seg in data:
+            try:
+                start_dt = dateutil.parser.parse(seg['start_time'])
+            except Exception:
+                continue
+            if start_dt.year != year:
+                continue
+            
+            mode = seg.get('type')
+            city = seg.get('city', 'Unknown')
+            country = seg.get('country', 'Unknown')
+            
+            if 'start_lat' in seg and 'end_lat' in seg:
+                end_dt = dateutil.parser.parse(seg.get('end_time', seg['start_time']))
+                end_city = seg.get('city', city)
+                end_country = seg.get('country', country)
+                if 'dep_city' in seg:
+                    city = seg['dep_city']
+                    country = seg.get('dep_country', country)
 
-        if dt.year != year:
-            continue
-
-        visit = seg.get('visit')
-        if visit:
-            top = visit.get('topCandidate', {})
-            loc = top.get('placeLocation')
-            mode = top.get('type')
-            if isinstance(loc, str) and loc.startswith("geo:"):
-                try:
-                    coord = loc[4:]
-                    lat_str, lon_str = coord.split(',')
-                    lat = float(lat_str)
-                    lon = float(lon_str)
-                    points.append({'dt': dt, 'lat': lat, 'lon': lon, 'mode': mode})
-                except Exception:
-                    pass
-
-        activity = seg.get('activity')
-        if activity:
-            act_top = activity.get('topCandidate', {})
-            act_mode = None
-            if isinstance(act_top, dict):
-                act_mode = act_top.get('type')
-
-            for key in ('start', 'end'):
-                loc = activity.get(key)
+                points.append({
+                    'dt': start_dt, 'lat': float(seg['start_lat']), 'lon': float(seg['start_lon']),
+                    'mode': mode, 'city': city, 'country': country
+                })
+                points.append({
+                    'dt': end_dt, 'lat': float(seg['end_lat']), 'lon': float(seg['end_lon']),
+                    'mode': mode, 'city': end_city, 'country': end_country
+                })
+            elif 'lat' in seg:
+                points.append({
+                    'dt': start_dt, 'lat': float(seg['lat']), 'lon': float(seg['lon']),
+                    'mode': mode, 'city': city, 'country': country
+                })
+    else:
+        for seg in segments:
+            start_str = seg.get('startTime')
+            if not start_str:
+                continue
+            try:
+                dt = dateutil.parser.parse(start_str)
+            except Exception:
+                continue
+    
+            if dt.year != year:
+                continue
+    
+            visit = seg.get('visit')
+            if visit:
+                top = visit.get('topCandidate', {})
+                loc = top.get('placeLocation')
+                mode = top.get('type')
                 if isinstance(loc, str) and loc.startswith("geo:"):
                     try:
                         coord = loc[4:]
                         lat_str, lon_str = coord.split(',')
                         lat = float(lat_str)
                         lon = float(lon_str)
-                        points.append({'dt': dt, 'lat': lat, 'lon': lon, 'mode': act_mode})
+                        points.append({'dt': dt, 'lat': lat, 'lon': lon, 'mode': mode})
                     except Exception:
                         pass
+    
+            activity = seg.get('activity')
+            if activity:
+                act_top = activity.get('topCandidate', {})
+                act_mode = None
+                if isinstance(act_top, dict):
+                    act_mode = act_top.get('type')
+    
+                for key in ('start', 'end'):
+                    loc = activity.get(key)
+                    if isinstance(loc, str) and loc.startswith("geo:"):
+                        try:
+                            coord = loc[4:]
+                            lat_str, lon_str = coord.split(',')
+                            lat = float(lat_str)
+                            lon = float(lon_str)
+                            points.append({'dt': dt, 'lat': lat, 'lon': lon, 'mode': act_mode})
+                        except Exception:
+                            pass
 
     if not points:
         print(f"No data points found for year {year}.")
@@ -337,7 +383,9 @@ def parse_timeline(input_path, year, flight_speedup, bridge_gaps_km=0.0, bridge_
                         'dt': dt_mid,
                         'lat': mlat,
                         'lon': mlon,
-                        'mode': mid_mode
+                        'mode': mid_mode,
+                        'city': curr.get('city'),
+                        'country': curr.get('country')
                     })
                 expanded_points.append(curr)
             else:
@@ -364,15 +412,27 @@ def parse_timeline(input_path, year, flight_speedup, bridge_gaps_km=0.0, bridge_
     modes = []
     xs = []
     ys = []
+    native_locations = []
+    has_native = False
 
     for p in points:
         timestamps.append(p['dt'])
         lats.append(p['lat'])
         lons.append(p['lon'])
         modes.append(p.get('mode'))
+        
+        if 'city' in p and 'country' in p and p['city'] and p['country']:
+            has_native = True
+            native_locations.append({'city': p['city'], 'country': p['country']})
+        else:
+            native_locations.append({'city': 'Unknown', 'country': 'Unknown'})
+            
         x, y = latlon_to_meters(p['lat'], p['lon'])
         xs.append(x)
         ys.append(y)
+
+    if not has_native:
+        native_locations = None
 
     # 누적 거리(실거리)와 누적 유효거리(애니메이션 시간축)를 분리한다.
     cum_dist_real = [0.0]
@@ -386,14 +446,15 @@ def parse_timeline(input_path, year, flight_speedup, bridge_gaps_km=0.0, bridge_
 
     for i in range(1, len(lats)):
         d = haversine_dist(lats[i - 1], lons[i - 1], lats[i], lons[i])
+        is_flight = (modes[i] == 'flying') or (modes[i - 1] == 'flying') or (str(modes[i]).upper() == 'FLYING')
+        
         total_real += d
         cum_dist_real.append(total_real)
 
-        is_flight = (modes[i] == 'flying') or (modes[i - 1] == 'flying')
         total_effective += d * (flight_weight if is_flight else 1.0)
         cum_dist_effective.append(total_effective)
 
-    return timestamps, xs, ys, cum_dist_effective, cum_dist_real, lats, lons
+    return timestamps, xs, ys, cum_dist_effective, cum_dist_real, lats, lons, modes, native_locations
 
 def main():
     parser = argparse.ArgumentParser(description="Google Timeline Visualizer")
@@ -420,7 +481,7 @@ def main():
         sys.exit(1)
     
     # Load
-    timestamps, xs, ys, cum_dist_effective, cum_dist_real, lats, lons = parse_timeline(
+    timestamps, xs, ys, cum_dist_effective, cum_dist_real, lats, lons, modes, native_locations = parse_timeline(
         args.input,
         args.year,
         args.flight_speedup,
@@ -459,6 +520,64 @@ def main():
     print("Calculating camera path...")
     cam_centers = []
     cam_spans = []
+    
+    # Reverse Geocode all points (ensure longitudes are wrapped back to [-180, 180] for the geocoder)
+    if native_locations:
+        print("Using native locations from JSON. Bypassing reverse geocoder...")
+        raw_locations = native_locations
+    else:
+        print("Reverse geocoding locations...")
+        wrapped_lons = [((lon + 180) % 360) - 180 for lon in lons]
+        coords = tuple(zip(lats, wrapped_lons))
+        try:
+            location_data = rg.search(coords)
+        except Exception as e:
+            print(f"Warning: Reverse geocoding failed: {e}")
+            location_data = [{'name': 'Unknown', 'cc': 'Unknown'}] * len(coords)
+
+        # Cache country names
+        country_cache = {}
+        raw_locations = []
+        for loc in location_data:
+            city = loc.get('name', 'Unknown')
+            admin1 = loc.get('admin1', '')
+            admin2 = loc.get('admin2', '')
+            cc = loc.get('cc', 'Unknown')
+            
+            if cc == 'KR':
+                major_cities = ['Seoul', 'Busan', 'Incheon', 'Daegu', 'Daejeon', 'Gwangju', 'Ulsan', 'Jeju', 'Sejong']
+                if admin1 in major_cities:
+                    city = admin1
+                elif admin2:
+                    city = admin2
+            elif cc == 'JP':
+                major_jp = ['Tokyo', 'Kyoto', 'Osaka', 'Hokkaido']
+                if admin1 in major_jp and not city:
+                    city = admin1
+                    
+            # Clean up some common trailing administrative terms for cleaner UI
+            if city != 'Unknown':
+                city = city.replace(' Town', '').replace(' Village', '').replace(' City', '')
+                if cc == 'KR':
+                    city = city.replace('-si', '').replace('-gun', '').replace('-gu', '')
+            
+            if cc not in country_cache:
+                country_cache[cc] = get_country_name(cc)
+            country = country_cache[cc]
+            raw_locations.append({'city': city, 'country': country})
+        
+    # Forward-fill flight destinations
+    frame_locations = list(raw_locations)
+    for i in range(len(modes)):
+        current_mode = str(modes[i]).upper() if modes[i] else ''
+        if 'FLYING' in current_mode or 'FLIGHT' in current_mode:
+            dest_idx = i
+            for j in range(i + 1, len(modes)):
+                dest_idx = j
+                next_mode = str(modes[j]).upper() if modes[j] else ''
+                if not ('FLYING' in next_mode or 'FLIGHT' in next_mode):
+                    break
+            frame_locations[i] = raw_locations[dest_idx]
     
     curr_x, curr_y = xs[0], ys[0]
     curr_span = 10000.0 # Start with 10km view
@@ -515,13 +634,25 @@ def main():
     head_point, = ax.plot([], [], color='black', marker='o', markersize=8, markeredgecolor=THEME_COLOR)
     
     # UI Elements
-    title_text = ax.text(0.5, 0.95, args.title, transform=ax.transAxes, 
-                         color='black', fontsize=16, fontweight='bold', ha='center', va='top',
-                         bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=5))
+    # White fading header background (top 15% of the screen)
+    header_rect = patches.Rectangle((0, 0.85), 1, 0.15, transform=ax.transAxes, facecolor='white', edgecolor='none', zorder=5, alpha=0.9)
+    ax.add_patch(header_rect)
+    
+    # Date and Country (e.g., 01-28 • USA) - gray, normal weight
+    date_country_text = ax.text(0.5, 0.965, '', transform=ax.transAxes, 
+                         color='#666666', fontsize=18, fontweight='normal', ha='center', va='top', zorder=6)
                          
-    date_text = ax.text(0.5, 0.90, '', transform=ax.transAxes, 
-                        color='gray', fontsize=14, ha='center', va='top',
-                        bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=3))
+    # City (e.g., San Francisco) - black, bold weight
+    city_text = ax.text(0.5, 0.925, '', transform=ax.transAxes, 
+                        color='#111111', fontsize=28, fontweight='bold', ha='center', va='top', zorder=6)
+
+    # Accumulated Distance (e.g., 1,234 km) - dark gray, normal weight
+    dist_text = ax.text(0.5, 0.875, '', transform=ax.transAxes, 
+                        color='#444444', fontsize=16, fontweight='normal', ha='center', va='top', zorder=6)
+
+    # Try different font fallbacks for emoji. Segoe UI Emoji is default on Windows.
+    emoji_font = 'Segoe UI Emoji' if 'Segoe UI Emoji' in [f.name for f in fm.fontManager.ttflist] else 'sans-serif'
+    emoji_text = ax.text(0, 0, '', color='black', fontsize=24, ha='center', va='bottom', fontfamily=emoji_font)
 
     def update(i):
         frame_idx = frame_indices[i]
@@ -554,10 +685,41 @@ def main():
         if _xs:
             head_point.set_data([_xs[-1]], [_ys[-1]])
             
-        if timestamps:
-            date_text.set_text(timestamps[frame_idx].strftime('%B %Y'))
+            # Update emoji based on current mode
+            current_mode = modes[frame_idx]
+            emoji = ''
+            if current_mode:
+                mode_str = str(current_mode).upper()
+                if 'FLYING' in mode_str or 'FLIGHT' in mode_str:
+                    emoji = '✈️'
+                elif 'VEHICLE' in mode_str or 'DRIVING' in mode_str or 'CAR' in mode_str:
+                    emoji = '🚗'
+                elif 'BUS' in mode_str:
+                    emoji = '🚌'
+                elif 'TRAIN' in mode_str:
+                    emoji = '🚆'
+                elif 'CYCLING' in mode_str or 'BICYCLE' in mode_str:
+                    emoji = '🚲'
+                elif 'WALKING' in mode_str or 'ON_FOOT' in mode_str:
+                    emoji = '🚶'
+                    
+            emoji_text.set_text(emoji)
+            emoji_text.set_position((_xs[-1], _ys[-1] + span/30))
             
-        return map_layer, path_line, tail_line, head_point, date_text,
+        if timestamps:
+            dt = timestamps[frame_idx]
+            date_str = dt.strftime('%m-%d')
+            loc = frame_locations[frame_idx]
+            country_str = loc['country']
+            city_str = loc['city']
+            
+            date_country_text.set_text(f"{date_str} • {country_str}")
+            city_text.set_text(f"{city_str}")
+            
+            dist_km = cum_dist_real[frame_idx]
+            dist_text.set_text(f"{int(dist_km):,} km")
+            
+        return map_layer, path_line, tail_line, head_point, date_country_text, city_text, dist_text, emoji_text,
 
     # Optional preview GIF (shorter segment)
     if getattr(args, 'preview_gif', False) or getattr(args, 'gif_only', False):

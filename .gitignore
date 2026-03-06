@@ -3,3 +3,7 @@ location-history.json
 .venv
 __pycache__
 *.gif
+lima_debug.txt
+lima_modes.txt
+tmp_lima.py
+processed_full.json
